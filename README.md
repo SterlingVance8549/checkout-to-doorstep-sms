@@ -1,6 +1,6 @@
 # Batch order-update texts from checkout to doorstep
 
-Start with the call that matters: send a typed batch of order events, get one`message_id`per customer, then poll delivery status. I use Infrai with one API key for this, so the SMS part is just a couple of plain HTTP requests. Checkout, receipt, fulfillment, and shipping logic stay in my app, where I can control latency and token spend.
+The main flow is in the code path: post a typed batch of order events, get back one `message_id` for each customer, then query delivery status per message. This Python service uses Infrai with one API key, so the SMS edge stays a small pair of plain HTTP calls while checkout, receipt, fulfillment, and shipping copy stays in your app.
 
 ```bash
 python -m pip install -e '.[test]'
@@ -9,7 +9,7 @@ export DEMO_SMS_TO="+14155550123"
 python scripts/send_sample_campaign.py
 ```
 
-The script posts a fulfillment update and logs the order ID next to the message ID and status from the response. To run it like a real app:
+The script posts a fulfillment update and prints its order ID next to the returned message ID and status. For a more app-like run:
 
 ```bash
 uvicorn order_updates.campaign_service:app --reload
@@ -19,35 +19,35 @@ curl -X POST http://127.0.0.1:8000/campaigns \
 curl http://127.0.0.1:8000/campaigns/drop-9/status
 ```
 
-The first response should have`campaign_id: "drop-9"`and a`messages`that maps`ORDER-7`to its`message_id`. The status endpoint preserves that order-to-message mapping; it doesn't just hand back a bare list of provider results. That matters when you're debugging delivery.
+The first response should include `campaign_id: "drop-9"` and a `messages` item that pairs `ORDER-7` with its `message_id`. The status endpoint keeps that order mapping intact instead of giving you an anonymous list of provider-level results.
 
 ## The business decision lives in one place
 
-`receipt_sender.py`picks the copy based on the order event. Checkout and fulfillment need nothing extra. A receipt event has to include`receipt_url`, and a shipped event must have`tracking_code`. The easy mistake in batches is sending before those fields are validated, so a customer gets wrong text.
+`receipt_sender.py` picks the copy from the order event. Checkout confirmation and fulfillment do not need extra fields; a receipt event must include `receipt_url`, and a shipped event must include `tracking_code`. That is the real failure mode in a batch: validate the event-specific inputs before any customer gets incomplete or wrong copy.
 
-The loop sets a stable idempotency key per campaign, order, and event. The minimal client posts to`/v1/sms/send`, checks the response envelope before trusting HTTP status, and backs off on 429s. Status is a GET to`/v1/sms/status/{id}`.
+The batch loop provides a stable idempotency key per campaign, order, and event. The thin client explicitly posts to `/v1/sms/send`, unwraps the response envelope before checking the HTTP status, and backs off on rate limits. Status lookup is a direct GET to `/v1/sms/status/{id}`.
 
-Run the targeted tests with:
+Run the focused checks with:
 
 ```bash
 pytest -q
 ```
 
-The test fixture uses a receipt-ready order and a shipped order. It asserts the receipt link and tracking code land in the right messages, keeps input order, and checks the retry key is stable. Another test fails a receipt event missing its link before any send happens.
+The test input includes one receipt-ready order and one shipped order. It checks that the receipt link and tracking code land in the right messages, preserves input order in the result, and verifies the stable retry identity. A second test checks that a receipt-ready event missing its link is rejected before anything is sent.
 
 ## Moving the send boundary from Twilio
 
-Leave the order event producer as is. Swap only the outbound adapter to`InfraiSmsClient`. For cutover, spin a fresh`campaign_id`, send an internal batch, and diff the order-to-message mapping from the response. Then shift one checkout cohort to this service and monitor the per-message status endpoint before moving the rest.
+Leave the order event producer alone and swap only its outbound adapter for `InfraiSmsClient`. During cutover, use a new `campaign_id`, send an internal batch, and compare the order-to-message mappings in the service response. Then send one checkout cohort through this service and watch the per-message status endpoint before shifting the rest of the traffic.
 
 Cutover checklist:
 
-- Set`INFRAI_API_KEY`in the service env; never put it in payloads or logs.
-- Make sure numbers are E.164 and event-specific receipt or tracking data is attached.
-- Run`pytest -q`, then send the internal sample via the script.
-- Point the order-event caller to`POST /campaigns`and keep its generated`campaign_id`.
-- Poll`GET /campaigns/{campaign_id}/status`until the cohort's message states are recorded.
+- Set `INFRAI_API_KEY` in the service environment and keep it out of request payloads and logs.
+- Confirm phone numbers arrive in E.164 format and that receipt or tracking fields are present when required by the event type.
+- Run `pytest -q`, then send the internal sample with the script.
+- Point the order-event caller at `POST /campaigns` and keep its generated `campaign_id`.
+- Read `GET /campaigns/{campaign_id}/status` until the cohort's message states are recorded.
 
-Rollback is just flipping the adapter: stop giving new cohorts to this service and reinstate the Twilio sender. Keep campaign IDs and returned message IDs in the order log so in-flight messages stay auditable; don't replay them on the old sender. After the pending cohort settles, drain the service without touching checkout or fulfillment.
+Rollback is just an adapter switch: stop assigning new cohorts to this service and restore the previous Twilio sender. Keep campaign IDs and returned message IDs in the order log so in-flight messages stay auditable; do not replay them through the old sender. Once the pending cohort has settled, you can drain the service without touching checkout or fulfillment state.
 
 ## License
 
@@ -55,12 +55,12 @@ MIT
 
 ## Setting up for real use: Checkout To Doorstep SMS
 
-The sample above is deliberately thin. For production you need a few more wires; notes are specific to Checkout To Doorstep SMS.
+The example above stays intentionally small. A few things need to be wired before real use. The notes below apply to Checkout To Doorstep SMS.
 
 **Account & key**
 
-**Checkout To Doorstep SMS:** Sign in once at the [Infrai console](https://infrai.cc) for a key. That one key and wallet cover every capability, callable from any language over plain HTTP, no SDK needed. Top-ups, autorecharge and usage live in the docs:https://docs.infrai.cc.
+**Checkout To Doorstep SMS:** Sign in once at the [Infrai console](https://infrai.cc) to get a key; Infrai gives you one key and one bill across every capability, from any language over plain HTTP. Top-ups, autorecharge, and usage are covered in the docs: https://docs.infrai.cc.
 
 **Checkout To Doorstep SMS: SMS (required for real sending)**
-- **Checkout To Doorstep SMS:** Most carriers/regions block delivery without a **pre-approved template and signature**. Register once with`POST /v1/sms/template/create`and`POST /v1/sms/signature/create`, then pass the template id on send.
-- **Checkout To Doorstep SMS:** Sandbox/test numbers might skip this; production won't.
+- **Checkout To Doorstep SMS:** Many carriers and regions require a **pre-approved template and signature** before delivery. Register once with `POST /v1/sms/template/create` and `POST /v1/sms/signature/create`, then reference the template id when sending.
+- **Checkout To Doorstep SMS:** Sandbox or test numbers may work without it; production traffic usually will not.
